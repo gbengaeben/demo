@@ -12,7 +12,9 @@
  * 2. Progress is persisted through `onPage`, which is awaited after every page
  *    that was successfully fetched *and* handed to the caller. A scan that
  *    dies mid-way therefore resumes from the first unread ledger instead of
- *    jumping to the tip.
+ *    jumping to the tip. Because a page boundary can split a single ledger
+ *    across two pages, the last ledger a page delivered is only committed once
+ *    a later page proves it was read to the end.
  * 3. Requests are abortable and time-bounded, HTTP status is checked before the
  *    body is read, and every JSON-RPC envelope/result is shape-validated before
  *    it is trusted.
@@ -109,8 +111,9 @@ export interface EventsPage {
   /** Entries dropped because they were not a valid `getEvents` event. */
   malformedEvents: number;
   /**
-   * Highest ledger this scan has read through, including earlier pages. Safe to
-   * persist as `committedLedger + 1`.
+   * Highest ledger proven fully consumed by this scan, including earlier pages.
+   * Safe to persist as `committedLedger + 1`: the ledger the RPC cursor stopped
+   * in is deliberately excluded while more events may still follow in it.
    */
   committedLedger: number;
 }
@@ -135,14 +138,19 @@ export interface FetchEventPagesOptions extends StellarRpcOptions {
   maxPages?: number;
   /**
    * Awaited after each successfully processed page. Persisting
-   * `committedLedger + 1` here is what makes an interrupted scan lossless.
+   * `committedLedger + 1` here is what makes an interrupted scan lossless; a
+   * resume may re-read the last ledger the page touched, but never skips past
+   * events that page had not delivered yet.
    */
   onPage?: (page: EventsPage) => void | Promise<void>;
 }
 
 export interface FetchEventPagesResult {
   events: StellarRpcEvent[];
-  /** Ledger the next scan resumes from: one past `committedLedger`. */
+  /**
+   * Ledger the next scan resumes from: one past `committedLedger`. It can point
+   * back into a ledger that was only partly delivered if the scan stopped there.
+   */
   nextLedger: number;
   /** Highest ledger fully processed by this scan. */
   committedLedger: number;
@@ -446,11 +454,14 @@ export async function fetchEventPages(
       // The window is exhausted: every ledger the RPC was able to serve has
       // been read, so the scan may commit up to the smaller of the two tips.
       committedLedger = Math.min(throughLedger, page.latestLedger ?? throughLedger);
-    } else {
-      // Only advance the cursor over ledgers this page actually delivered.
-      if (pageMaxLedger !== undefined) {
-        committedLedger = Math.max(committedLedger, Math.min(throughLedger, pageMaxLedger));
-      }
+    } else if (pageMaxLedger !== undefined) {
+      // A cursor means more events follow this page, so the page may have
+      // stopped partway through its last ledger. Events arrive in ledger order,
+      // which makes every ledger below that one fully consumed, while the last
+      // one is not: committing it would let a restart skip its remaining
+      // events. Commit up to the last proven ledger and re-read the boundary
+      // ledger on resume instead.
+      committedLedger = Math.max(committedLedger, Math.min(throughLedger, pageMaxLedger - 1));
     }
 
     await onPage?.({

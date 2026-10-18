@@ -378,7 +378,9 @@ describe('stellar-scanner worker message contract', () => {
 
     const pages = messages.filter((message) => message.type === 'PAGE');
     expect(pages).toHaveLength(2);
-    expect(pages[0]).toMatchObject({ page: 1, events: 1_000, committedLedger: 100 });
+    // All 1,000 events share ledger 100 and the page still has a cursor, so the
+    // ledger could continue on the next page and may not be committed yet.
+    expect(pages[0]).toMatchObject({ page: 1, events: 1_000, committedLedger: 99 });
     // The second page is only reachable by following the RPC cursor.
     const dataRequests = requests.filter(
       (request) => request.method === 'getEvents' && request.params?.pagination?.limit !== 1,
@@ -418,7 +420,7 @@ describe('stellar-scanner worker message contract', () => {
       pages,
       failPage: { page: 2, status: 503 },
     });
-    const failed = await postAndWaitForResult({
+    const { messages: failedMessages, terminal: failed } = await runScan({
       rpcUrl: RPC_URL,
       announcerContract: CONTRACT_ID,
       viewingKey: recipient.viewingKey,
@@ -430,8 +432,15 @@ describe('stellar-scanner worker message contract', () => {
 
     expect(failed.type).toBe('ERROR');
 
+    // The first page stopped inside ledger 1,100, so its remaining events stay
+    // uncommitted and the persisted cursor points back at that ledger.
+    const firstPage = failedMessages.find((message) => message.type === 'PAGE');
+    expect(firstPage).toMatchObject({ page: 1, committedLedger: 1_099 });
+    const persistedStartLedger = Number(firstPage?.committedLedger) + 1;
+    expect(persistedStartLedger).toBe(1_100);
+
     // Rescan from the cursor the page persisted: the failed page must still be
-    // read, and nothing before or after it may be skipped or re-scanned.
+    // read, and nothing after it may be skipped.
     mockPagedGetEvents({ latestLedger: 5_000, requests, pages: [pages[1]] });
     const resumed = await postAndWaitForResult({
       rpcUrl: RPC_URL,
@@ -440,13 +449,13 @@ describe('stellar-scanner worker message contract', () => {
       spendingPubKey: recipient.spendingPubKey,
       spendingScalar: recipient.spendingScalar,
       strategy: 'balanced',
-      startLedger: 1_101,
+      startLedger: persistedStartLedger,
     });
 
     const resumedDataRequests = requests.filter(
       (request) => request.method === 'getEvents' && request.params?.pagination?.limit !== 1,
     );
-    expect(resumedDataRequests[resumedDataRequests.length - 1].params.startLedger).toBe(1_101);
+    expect(resumedDataRequests[resumedDataRequests.length - 1].params.startLedger).toBe(1_100);
     expect(resumed.type).toBe('SUCCESS');
     expect(resumed.results).toHaveLength(1);
   });

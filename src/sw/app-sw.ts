@@ -181,7 +181,8 @@ async function updateLastScannedLedger(
 // src/lib/stellar/rpcEvents.ts. It follows the RPC cursor to the end of the
 // committed boundary, maps out-of-range requests to retention gaps, and reports
 // progress per page so a sync that is killed mid-way restarts at the first
-// ledger it has not announced yet instead of at the tip.
+// ledger proven fully announced instead of at the tip. A page boundary can
+// split one ledger, so the boundary ledger is re-read rather than skipped.
 
 async function notifyRetentionGap(publicKey: string, gap: RetentionGap): Promise<void> {
   const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });

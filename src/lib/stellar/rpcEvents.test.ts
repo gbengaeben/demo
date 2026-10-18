@@ -122,7 +122,9 @@ describe('Stellar RPC event pagination', () => {
     expect(result.events).toHaveLength(2_500);
     expect(result.pages).toBe(3);
     expect(result.truncated).toBe(false);
-    expect(progress.map((page) => page.committedLedger)).toEqual([1_000, 2_000, 3_000]);
+    // A page boundary can split a ledger, so only ledgers below the boundary
+    // ledger are committed mid-scan; the final, exhausted page commits the tip.
+    expect(progress.map((page) => page.committedLedger)).toEqual([999, 1_999, 3_000]);
     expect(progress.map((page) => page.events.length)).toEqual([1_000, 1_000, 500]);
 
     const dataRequests = requests.filter(isDataRequest);
@@ -156,7 +158,7 @@ describe('Stellar RPC event pagination', () => {
     ).rejects.toBeInstanceOf(StellarRpcHttpError);
 
     // Only the first page was delivered, so only the first page may be committed.
-    expect(progress).toEqual([1_000]);
+    expect(progress).toEqual([999]);
 
     // A restart from that committed cursor must read the failed page again
     // instead of jumping to the tip.
@@ -173,7 +175,7 @@ describe('Stellar RPC event pagination', () => {
     });
 
     const dataRequests = resumedRequests.filter(isDataRequest);
-    expect(dataRequests[0].params.startLedger).toBe(1_001);
+    expect(dataRequests[0].params.startLedger).toBe(1_000);
     expect(dataRequests[1].params.pagination.cursor).toBe('c1');
     expect(resumed.events).toHaveLength(1_500);
     expect(resumed.committedLedger).toBe(3_000);
@@ -328,9 +330,90 @@ describe('Stellar RPC event pagination', () => {
 
     expect(result.truncated).toBe(true);
     expect(result.pages).toBe(2);
-    expect(progress).toEqual([100, 200]);
-    // The next scan resumes from the last page actually delivered.
-    expect(result.nextLedger).toBe(201);
+    expect(progress).toEqual([99, 199]);
+    // The next scan resumes at the last ledger actually proven complete.
+    expect(result.nextLedger).toBe(200);
+  });
+
+  it('does not commit a ledger whose events continue on a rejected page', async () => {
+    // Both pages carry events from ledger 500: page 1 stops inside it and page 2
+    // was going to deliver the rest before failing.
+    mockRpc(
+      pagedResponder({
+        latestLedger: 505,
+        pages: [
+          [...eventRange(490, 499), event(500), event(500)],
+          [event(500), event(500)],
+        ],
+        failDataPage: { page: 2, status: 503 },
+      }),
+    );
+    const progress: EventsPage[] = [];
+
+    await expect(
+      fetchEventPages({
+        rpcUrl: RPC_URL,
+        contractId: CONTRACT_ID,
+        startLedger: 500,
+        onPage: (page) => {
+          progress.push(page);
+        },
+      }),
+    ).rejects.toBeInstanceOf(StellarRpcHttpError);
+
+    // Ledger 500 was only partly delivered before the page failed, so it must
+    // not be committed even though its events appeared on the first page.
+    expect(progress).toHaveLength(1);
+    expect(progress[0].events.filter((entry) => entry.ledger === 500)).toHaveLength(2);
+    expect(progress[0].committedLedger).toBe(499);
+
+    const resumedRequests = mockRpc(
+      pagedResponder({
+        latestLedger: 505,
+        pages: [
+          [event(500), event(500)],
+          [event(500), event(500)],
+        ],
+      }),
+    );
+    const resumedStartLedger = progress[progress.length - 1].committedLedger + 1;
+    const resumed = await fetchEventPages({
+      rpcUrl: RPC_URL,
+      contractId: CONTRACT_ID,
+      startLedger: resumedStartLedger,
+    });
+
+    // The restart begins inside ledger 500 rather than at 501, so nothing is skipped.
+    expect(resumedStartLedger).toBe(500);
+    expect(resumedRequests.filter(isDataRequest)[0].params.startLedger).toBe(500);
+    expect(resumed.events.filter((entry) => entry.ledger === 500)).toHaveLength(4);
+    expect(resumed.committedLedger).toBe(505);
+  });
+
+  it('reads a boundary ledger to its end instead of stopping at the first page that touches it', async () => {
+    mockRpc(
+      pagedResponder({
+        latestLedger: 500,
+        pages: [[event(500), event(500)], [event(500)]],
+      }),
+    );
+    const progress: number[] = [];
+
+    const result = await fetchEventPages({
+      rpcUrl: RPC_URL,
+      contractId: CONTRACT_ID,
+      startLedger: 500,
+      throughLedger: 500,
+      onPage: (page) => {
+        progress.push(page.committedLedger);
+      },
+    });
+
+    expect(result.events).toHaveLength(3);
+    expect(result.pages).toBe(2);
+    expect(progress).toEqual([499, 500]);
+    expect(result.committedLedger).toBe(500);
+    expect(result.nextLedger).toBe(501);
   });
 
   it('fails loudly when the RPC repeats a cursor', async () => {

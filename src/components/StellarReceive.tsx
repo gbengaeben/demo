@@ -1152,7 +1152,8 @@ export function StellarReceive() {
         if (type === 'PAGE') {
           // Each page advances the stored cursor only once its matches have been
           // handed to the page, so an interrupted scan resumes at the first
-          // ledger it has not scanned instead of at the tip.
+          // ledger proven complete instead of at the tip. A ledger that the RPC
+          // page boundary split is re-read, and matches are deduped below.
           if (address && Number.isSafeInteger(committedLedger)) {
             writeScanCursor(localStorage, address, committedLedger + 1);
           }

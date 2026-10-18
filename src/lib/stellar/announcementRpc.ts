@@ -15,7 +15,11 @@ export interface AnnouncementPage {
   announcements: Announcement[];
   /** Events whose announcement payload could not be decoded. */
   undecodableEvents: number;
-  /** Highest ledger covered by processed pages so far (`committedLedger + 1` resumes). */
+  /**
+   * Highest ledger proven fully consumed by processed pages so far
+   * (`committedLedger + 1` resumes). A ledger the RPC cursor stopped inside is
+   * excluded, so its remaining announcements are re-read on resume.
+   */
   committedLedger: number;
 }
 
